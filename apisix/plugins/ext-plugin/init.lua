@@ -36,6 +36,7 @@ if is_http then
     ngx_pipe = require("ngx.pipe")
     events = require("resty.worker.events")
 end
+local resty_signal = require "resty.signal"
 local bit = require("bit")
 local band = bit.band
 local lshift = bit.lshift
@@ -79,19 +80,11 @@ local schema = {
                     value = {
                         type = "string",
                     },
-                }
+                },
+                required = {"name", "value"}
             },
             minItems = 1,
         },
-        extra_info = {
-            type = "array",
-            items = {
-                type = "string",
-                maxLength = 64,
-                minLength = 1,
-            },
-            minItems = 1,
-        }
     },
 }
 
@@ -312,8 +305,8 @@ local rpc_handlers = {
         core.log.notice("get conf token: ", token, " conf: ", core.json.delay_encode(conf.conf))
         return token
     end,
-    function (conf, ctx, sock)
-        local token, err = core.lrucache.plugin_ctx(lrucache, ctx, nil, rpc_call,
+    function (conf, ctx, sock, entry)
+        local token, err = core.lrucache.plugin_ctx(lrucache, ctx, entry, rpc_call,
                                                     constants.RPC_PREPARE_CONF, conf, ctx)
         if not token then
             return nil, err
@@ -505,7 +498,7 @@ local rpc_handlers = {
 }
 
 
-rpc_call = function (ty, conf, ctx)
+rpc_call = function (ty, conf, ctx, ...)
     local path = helper.get_path()
 
     local sock = socket_tcp()
@@ -515,7 +508,7 @@ rpc_call = function (ty, conf, ctx)
         return nil, "failed to connect to the unix socket " .. path .. ": " .. err
     end
 
-    local res, err, code, body = rpc_handlers[ty + 1](conf, ctx, sock)
+    local res, err, code, body = rpc_handlers[ty + 1](conf, ctx, sock, ...)
     if not res then
         sock:close()
         return nil, err
@@ -527,20 +520,6 @@ rpc_call = function (ty, conf, ctx)
     end
 
     return res, nil, code, body
-end
-
-
-function _M.communicate(conf, ctx)
-    local ok, err, code, body = rpc_call(constants.RPC_HTTP_REQ_CALL, conf, ctx)
-    if not ok then
-        core.log.error(err)
-        return 503
-    end
-
-    if code then
-        return code, body
-    end
-    return
 end
 
 
@@ -556,13 +535,48 @@ local function create_lrucache()
 end
 
 
+function _M.communicate(conf, ctx, plugin_name)
+    local ok, err, code, body
+    local tries = 0
+    while tries < 3 do
+        tries = tries + 1
+        ok, err, code, body = rpc_call(constants.RPC_HTTP_REQ_CALL, conf, ctx, plugin_name)
+        if ok then
+            if code then
+                return code, body
+            end
+
+            return
+        end
+
+        if not core.string.find(err, "conf token not found") then
+            core.log.error(err)
+            return 503
+        end
+
+        core.log.warn("refresh cache and try again")
+        create_lrucache()
+    end
+
+    core.log.error(err)
+    return 503
+end
+
+
+local function must_set(env, value)
+    local ok, err = core.os.setenv(env, value)
+    if not ok then
+        error(str_format("failed to set %s: %s", env, err), 2)
+    end
+end
+
+
 local function spawn_proc(cmd)
+    must_set("APISIX_CONF_EXPIRE_TIME", helper.get_conf_token_cache_time())
+    must_set("APISIX_LISTEN_ADDRESS", helper.get_path())
+
     local opt = {
         merge_stderr = true,
-        environ = {
-            "APISIX_CONF_EXPIRE_TIME=" .. helper.get_conf_token_cache_time(),
-            "APISIX_LISTEN_ADDRESS=" .. helper.get_path(),
-        },
     }
     local proc, err = ngx_pipe.spawn(cmd, opt)
     if not proc then
@@ -575,8 +589,10 @@ local function spawn_proc(cmd)
 end
 
 
+local runner
 local function setup_runner(cmd)
-    local proc = spawn_proc(cmd)
+    runner = spawn_proc(cmd)
+
     ngx_timer_at(0, function(premature)
         if premature then
             return
@@ -586,7 +602,7 @@ local function setup_runner(cmd)
             while true do
                 -- drain output
                 local max = 3800 -- smaller than Nginx error log length limit
-                local data, err = proc:stdout_read_any(max)
+                local data, err = runner:stdout_read_any(max)
                 if not data then
                     if exiting() then
                         return
@@ -602,18 +618,22 @@ local function setup_runner(cmd)
                 end
             end
 
-            local ok, reason, status = proc:wait()
+            local ok, reason, status = runner:wait()
             if not ok then
                 core.log.warn("runner exited with reason: ", reason, ", status: ", status)
             end
+
+            runner = nil
 
             local ok, err = events.post(events_list._source, events_list.runner_exit)
             if not ok then
                 core.log.error("post event failure with ", events_list._source, ", error: ", err)
             end
 
-            core.log.warn("respawn runner with cmd: ", core.json.encode(cmd))
-            proc = spawn_proc(cmd)
+            core.log.warn("respawn runner 3 seconds later with cmd: ", core.json.encode(cmd))
+            core.utils.sleep(3)
+            core.log.warn("respawning new runner...")
+            runner = spawn_proc(cmd)
         end
     end)
 end
@@ -637,6 +657,23 @@ function _M.init_worker()
     -- note that the runner is run under the same user as the Nginx master
     if process.type() == "privileged agent" then
         setup_runner(cmd)
+    end
+end
+
+
+function _M.exit_worker()
+    if process.type() == "privileged agent" and runner then
+        -- We need to send SIGTERM in the exit_worker phase, as:
+        -- 1. privileged agent doesn't support graceful exiting when I write this
+        -- 2. better to make it work without graceful exiting
+        local pid = runner:pid()
+        core.log.notice("terminate runner ", pid, " with SIGTERM")
+        local num = resty_signal.signum("TERM")
+        runner:kill(num)
+
+        -- give 1s to clean up the mess
+        core.os.waitpid(pid, 1)
+        -- then we KILL it via gc finalizer
     end
 end
 

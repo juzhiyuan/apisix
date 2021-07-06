@@ -37,6 +37,9 @@ title: Plugin Develop
   - [Register public API](#register-public-api)
   - [Register control API](#register-control-api)
 
+This documentation is about developing plugin in Lua. For other languages,
+see [external plugin](./external-plugin.md).
+
 ## where to put your plugins
 
 There are two ways to add new features based on APISIX.
@@ -107,7 +110,7 @@ local _M = {
 }
 ```
 
-Note : The priority of the new plugin cannot be same to any existing ones, you can use the `/v1/schema` method of [control API](./control-api.md#get-v1schema) to view the priority of all plugins. In addition, plugins with higher priority value will be executed first in a given phase (see the definition of `phase` in [choose-phase-to-run](#choose-phase-to-run)). For example, the priority of example-plugin is 0 and the priority of ip-restriction is 3000. Therefore, the ip-restriction plugin will be executed first, then the example-plugin plugin.
+Note : The priority of the new plugin cannot be same to any existing ones, you can use the `/v1/schema` method of [control API](./control-api.md#get-v1schema) to view the priority of all plugins. In addition, plugins with higher priority value will be executed first in a given phase (see the definition of `phase` in [choose-phase-to-run](#choose-phase-to-run)). For example, the priority of example-plugin is 0 and the priority of ip-restriction is 3000. Therefore, the ip-restriction plugin will be executed first, then the example-plugin plugin. It's recommended to use priority 1 ~ 99 for your plugin unless you want it to run before some builtin plugins.
 
 in the "__conf/config-default.yaml__" configuration file, the enabled plugins (all specified by plugin name) are listed.
 
