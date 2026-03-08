@@ -25,6 +25,7 @@ local ipairs         = ipairs
 local pairs          = pairs
 local next           = next
 local type           = type
+local tostring       = tostring
 local string_sub     = string.sub
 local string_find    = string.find
 local consumers
