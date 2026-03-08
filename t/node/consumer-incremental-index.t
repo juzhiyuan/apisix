@@ -69,6 +69,7 @@ __DATA__
     }
 --- request
 GET /t
+--- error_code: 201
 --- response_body
 passed
 
@@ -92,6 +93,7 @@ passed
     }
 --- request
 GET /t
+--- error_code: 201
 --- response_body
 passed
 
@@ -117,6 +119,7 @@ passed
     }
 --- request
 GET /t
+--- error_code: 201
 --- response_body
 passed
 
@@ -142,6 +145,7 @@ passed
     }
 --- request
 GET /t
+--- error_code: 201
 --- response_body
 passed
 
