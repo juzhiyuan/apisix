@@ -341,8 +341,8 @@ local function sync_lookup_maps(index, old_consumer, new_consumer)
     local etcd_key = old_consumer and old_consumer._etcd_key or new_consumer._etcd_key
 
     for key_attr, lookup_map in pairs(index.lookup_maps) do
-        local old_key = old_consumer and old_consumer.auth_conf[key_attr]
-        local new_key = new_consumer and new_consumer.auth_conf[key_attr]
+        local old_key = old_consumer and get_filled_consumer(old_consumer).auth_conf[key_attr]
+        local new_key = new_consumer and get_filled_consumer(new_consumer).auth_conf[key_attr]
 
         if old_key and old_key ~= new_key then
             remove_lookup_member(lookup_map, old_key, etcd_key)
@@ -418,7 +418,25 @@ local function remove_index_consumer(index, etcd_key)
         index.pos_by_etcd_key[last_consumer._etcd_key] = pos
     end
 
-    return sync_lookup_maps(index, old_consumer, nil)
+    local ok, err = sync_lookup_maps(index, old_consumer, nil)
+    if not ok then
+        return nil, err
+    end
+
+    if last_consumer and last_consumer._etcd_key ~= etcd_key then
+        local filled_consumer = get_filled_consumer(last_consumer)
+        for key_attr, lookup_map in pairs(index.lookup_maps) do
+            local auth_key = filled_consumer.auth_conf[key_attr]
+            if auth_key ~= nil then
+                local refreshed, refresh_err = refresh_lookup_winner(index, lookup_map, auth_key)
+                if not refreshed then
+                    return nil, refresh_err
+                end
+            end
+        end
+    end
+
+    return true
 end
 
 
@@ -429,10 +447,11 @@ local function create_incremental_consume_cache(index, key_attr)
     }
 
     for _, consumer in ipairs(index.nodes) do
-        local auth_key = consumer.auth_conf[key_attr]
+        local filled_consumer = get_filled_consumer(consumer)
+        local auth_key = filled_consumer.auth_conf[key_attr]
         if auth_key ~= nil then
             add_lookup_member(lookup_map, auth_key, consumer._etcd_key)
-            lookup_map.values[auth_key] = get_filled_consumer(consumer)
+            lookup_map.values[auth_key] = filled_consumer
         end
     end
 
@@ -531,7 +550,8 @@ local function apply_incremental_plugin_index(index, plugin_name)
         keys_to_process[short_key] = true
 
         if is_consumer_short_key(short_key) then
-            local credential_keys = credential_keys_by_consumer[get_consumer_name_from_short_key(short_key)]
+            local consumer_name = get_consumer_name_from_short_key(short_key)
+            local credential_keys = credential_keys_by_consumer[consumer_name]
             if credential_keys then
                 for credential_key in pairs(credential_keys) do
                     keys_to_process[credential_key] = true
