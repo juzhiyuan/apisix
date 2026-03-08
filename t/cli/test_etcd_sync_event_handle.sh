@@ -19,6 +19,58 @@
 
 . ./t/cli/common.sh
 
+check_round_2_requests() {
+    local code
+
+    code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9080/1)" || return 1
+    if [ "$code" != "204" ]; then
+        return 1
+    fi
+
+    code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9080/2)" || return 1
+    if [ "$code" != "503" ]; then
+        return 1
+    fi
+
+    code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9080/3)" || return 1
+    if [ "$code" != "204" ]; then
+        return 1
+    fi
+
+    code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9080/4)" || return 1
+    if [ "$code" != "204" ]; then
+        return 1
+    fi
+
+    code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9080/5)" || return 1
+    if [ "$code" != "204" ]; then
+        return 1
+    fi
+
+    code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9080/6)" || return 1
+    if [ "$code" != "404" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+wait_for_round_2_sync() {
+    local i
+
+    for i in {1..20}; do
+        if check_round_2_requests \
+            && grep -q "etcd events sent in bulk" logs/error.log \
+            && grep -q "failed to check item data" logs/error.log; then
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    return 1
+}
+
 # check etcd while enable auth
 git checkout conf/config.yaml
 
@@ -89,7 +141,11 @@ etcdctl --endpoints=127.0.0.1:2379 --user=root:apache-api6-sync put /apisix/rout
 etcdctl --endpoints=127.0.0.1:2379 --user=root:apache-api6-sync auth disable
 etcdctl --endpoints=127.0.0.1:2379 user delete root
 etcdctl --endpoints=127.0.0.1:2379 role delete root
-sleep 5 # wait resync by watch
+
+if ! wait_for_round_2_sync; then
+    echo "failed: timed out waiting for watch backlog to be applied"
+    exit 1
+fi
 
 # Test request
 # All but the intentionally incoming misconfigurations should be applied,
