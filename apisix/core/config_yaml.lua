@@ -219,6 +219,8 @@ local function sync_data(self)
         return true
     end
 
+    self.full_sync_version = conf_version
+
     local items = apisix_yaml[self.key]
     if not items then
         self.values = new_tab(8, 0)
@@ -494,6 +496,7 @@ function _M.new(key, opts)
         sync_times = 0,
         running = true,
         conf_version = 0,
+        full_sync_version = 0,
         values = nil,
         routes_hash = nil,
         prev_index = nil,

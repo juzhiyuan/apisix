@@ -23,8 +23,11 @@ local check_schema   = require("apisix.core.schema").check
 local error          = error
 local ipairs         = ipairs
 local pairs          = pairs
+local next           = next
 local type           = type
+local tostring       = tostring
 local string_sub     = string.sub
+local string_find    = string.find
 local consumers
 
 
@@ -40,6 +43,10 @@ local lrucache = core.lrucache.new({
 -- variable based on the number of consumers in the current environment,
 -- taking into account the appropriate adjustment coefficient.
 local consumers_count_for_lrucache = 4096
+local incremental_consumer_index_enabled = false
+local plugin_indexes = {}
+local credential_keys_by_consumer = {}
+local credential_keys_full_sync_version = 0
 
 local function remove_etcd_prefix(key)
     local prefix = ""
@@ -73,6 +80,28 @@ local function get_credential_id_from_etcd_key(key)
     return uri_segs[5]
 end
 
+local function get_consumer_short_key(key)
+    local short_key = remove_etcd_prefix(key)
+    return string_sub(short_key, #"/consumers/" + 1)
+end
+
+local function is_consumer_short_key(key)
+    return key and not string_find(key, "/credentials/", 1, true)
+end
+
+local function get_consumer_name_from_short_key(key)
+    if not key then
+        return nil
+    end
+
+    local pos = string_find(key, "/credentials/", 1, true)
+    if not pos then
+        return key
+    end
+
+    return string_sub(key, 1, pos - 1)
+end
+
 local function filter_consumers_list(data_list)
     if #data_list == 0 then
         return data_list
@@ -89,12 +118,18 @@ local function filter_consumers_list(data_list)
 end
 
 local plugin_consumer
+local construct_consumer_data
+local get_filled_consumer
+local create_consume_cache
 do
     local consumers_id_lrucache = core.lrucache.new({
             count = consumers_count_for_lrucache
         })
+    local consumer_lrucache = core.lrucache.new({
+            count = consumers_count_for_lrucache
+        })
 
-local function construct_consumer_data(val, name, plugin_config)
+function construct_consumer_data(val, name, plugin_config)
     -- if the val is a Consumer, clone it to the local consumer;
     -- if the val is a Credential, to get the Consumer by consumer_name and then clone
     -- it to the local consumer.
@@ -103,7 +138,7 @@ local function construct_consumer_data(val, name, plugin_config)
         local consumer_name = get_consumer_name_from_credential_etcd_key(val.key)
         local the_consumer = consumers:get(consumer_name)
         if the_consumer and the_consumer.value then
-            consumer = consumers_id_lrucache(val.value.id .. name, val.modifiedIndex..
+            consumer = consumers_id_lrucache(val.value.id .. name, val.modifiedIndex ..
                                                 the_consumer.modifiedIndex,
                 function (val, the_consumer)
                     consumer = core.table.clone(the_consumer.value)
@@ -112,11 +147,7 @@ local function construct_consumer_data(val, name, plugin_config)
                     return consumer
                 end, val, the_consumer)
         else
-            -- Normally wouldn't get here:
-            -- it should belong to a consumer for any credential.
-            return nil, "failed to get the consumer for the credential,",
-                " a wild credential has appeared!",
-                " credential key: ", val.key, ", consumer name: ", consumer_name
+            return nil, "failed to get the consumer for the credential, key: " .. val.key
         end
     else
         consumer = consumers_id_lrucache(val.value.id .. name, val.modifiedIndex,
@@ -127,18 +158,27 @@ local function construct_consumer_data(val, name, plugin_config)
             end, val)
     end
 
-    -- if the consumer has labels, set the field custom_id to it.
-    -- the custom_id is used to set in the request headers to the upstream.
     if consumer.labels then
         consumer.custom_id = consumer.labels["custom_id"]
     end
 
-    -- Note: the id here is the key of consumer data, which
-    -- is 'username' field in admin
     consumer.consumer_name = consumer.id
+    consumer._etcd_key = get_consumer_short_key(val.key)
     consumer.auth_conf = plugin_config
 
     return consumer
+end
+
+
+local function fill_consumer_secret(consumer)
+    local new_consumer = core.table.clone(consumer)
+    new_consumer.auth_conf = secret.fetch_secrets(new_consumer.auth_conf, false)
+    return new_consumer
+end
+
+
+function get_filled_consumer(consumer)
+    return consumer_lrucache(consumer, nil, fill_consumer_secret, consumer)
 end
 
 
@@ -149,9 +189,6 @@ function plugin_consumer()
         return plugins
     end
 
-    -- consumers.values is the list that got from etcd by prefix key {etcd_prefix}/consumers.
-    -- So it contains consumers and credentials.
-    -- The val in the for-loop may be a Consumer or a Credential.
     for _, val in ipairs(consumers.values) do
         if type(val) ~= "table" then
             goto CONTINUE
@@ -176,8 +213,7 @@ function plugin_consumer()
                 end
 
                 plugins[name].len = plugins[name].len + 1
-                core.table.insert(plugins[name].nodes, plugins[name].len,
-                                    consumer)
+                core.table.insert(plugins[name].nodes, plugins[name].len, consumer)
             end
         end
 
@@ -187,6 +223,358 @@ function plugin_consumer()
     return plugins
 end
 
+
+function create_consume_cache(consumers_conf, key_attr)
+    local consumer_names = {}
+
+    for _, consumer in ipairs(consumers_conf.nodes) do
+        local new_consumer = get_filled_consumer(consumer)
+        consumer_names[new_consumer.auth_conf[key_attr]] = new_consumer
+    end
+
+    return consumer_names
+end
+
+end
+
+
+local function new_plugin_index(plugin_name)
+    return {
+        plugin_name = plugin_name,
+        conf_version = 0,
+        full_sync_version = 0,
+        built = false,
+        invalid = false,
+        dirty_keys = {},
+        nodes = {},
+        len = 0,
+        pos_by_etcd_key = {},
+        by_etcd_key = {},
+        lookup_maps = {},
+    }
+end
+
+
+local function clear_plugin_index(index)
+    index.conf_version = 0
+    index.full_sync_version = 0
+    index.built = false
+    index.invalid = false
+    index.dirty_keys = {}
+    index.nodes = {}
+    index.len = 0
+    index.pos_by_etcd_key = {}
+    index.by_etcd_key = {}
+    index.lookup_maps = {}
+end
+
+
+local function add_lookup_member(lookup_map, auth_key, etcd_key)
+    if auth_key == nil or not etcd_key then
+        return
+    end
+
+    local members = lookup_map.members[auth_key]
+    if not members then
+        members = {}
+        lookup_map.members[auth_key] = members
+    end
+
+    members[etcd_key] = true
+end
+
+
+local function remove_lookup_member(lookup_map, auth_key, etcd_key)
+    if auth_key == nil or not etcd_key then
+        return
+    end
+
+    local members = lookup_map.members[auth_key]
+    if not members then
+        return
+    end
+
+    members[etcd_key] = nil
+    if next(members) == nil then
+        lookup_map.members[auth_key] = nil
+    end
+end
+
+
+local function refresh_lookup_winner(index, lookup_map, auth_key)
+    if auth_key == nil then
+        return true
+    end
+
+    local members = lookup_map.members[auth_key]
+    if not members then
+        lookup_map.values[auth_key] = nil
+        return true
+    end
+
+    local winner
+    local winner_pos = 0
+    for etcd_key in pairs(members) do
+        local consumer = index.by_etcd_key[etcd_key]
+        local pos = index.pos_by_etcd_key[etcd_key]
+        if not consumer or not pos then
+            return nil, "failed to locate consumer by etcd key: " .. tostring(etcd_key)
+        end
+
+        if pos >= winner_pos then
+            winner = consumer
+            winner_pos = pos
+        end
+    end
+
+    if not winner then
+        lookup_map.members[auth_key] = nil
+        lookup_map.values[auth_key] = nil
+        return true
+    end
+
+    lookup_map.values[auth_key] = get_filled_consumer(winner)
+    return true
+end
+
+
+local function sync_lookup_maps(index, old_consumer, new_consumer)
+    local etcd_key = old_consumer and old_consumer._etcd_key or new_consumer._etcd_key
+
+    for key_attr, lookup_map in pairs(index.lookup_maps) do
+        local old_key = old_consumer and get_filled_consumer(old_consumer).auth_conf[key_attr]
+        local new_key = new_consumer and get_filled_consumer(new_consumer).auth_conf[key_attr]
+
+        if old_key and old_key ~= new_key then
+            remove_lookup_member(lookup_map, old_key, etcd_key)
+        end
+        if new_key then
+            add_lookup_member(lookup_map, new_key, etcd_key)
+        end
+
+        if old_key == new_key then
+            local ok, err = refresh_lookup_winner(index, lookup_map, old_key)
+            if not ok then
+                return nil, err
+            end
+        else
+            if old_key then
+                local ok, err = refresh_lookup_winner(index, lookup_map, old_key)
+                if not ok then
+                    return nil, err
+                end
+            end
+            if new_key then
+                local ok, err = refresh_lookup_winner(index, lookup_map, new_key)
+                if not ok then
+                    return nil, err
+                end
+            end
+        end
+    end
+
+    return true
+end
+
+
+local function upsert_index_consumer(index, consumer)
+    local etcd_key = consumer._etcd_key
+    local pos = index.pos_by_etcd_key[etcd_key]
+    if pos then
+        local old_consumer = index.nodes[pos]
+        if not old_consumer then
+            return nil, "failed to locate existing consumer at position: " .. pos
+        end
+
+        index.nodes[pos] = consumer
+        index.by_etcd_key[etcd_key] = consumer
+        return sync_lookup_maps(index, old_consumer, consumer)
+    end
+
+    index.len = index.len + 1
+    pos = index.len
+    index.nodes[pos] = consumer
+    index.pos_by_etcd_key[etcd_key] = pos
+    index.by_etcd_key[etcd_key] = consumer
+
+    return sync_lookup_maps(index, nil, consumer)
+end
+
+
+local function remove_index_consumer(index, etcd_key)
+    local pos = index.pos_by_etcd_key[etcd_key]
+    if not pos then
+        return true
+    end
+
+    local old_consumer = index.nodes[pos]
+    local last_consumer = index.nodes[index.len]
+    index.nodes[pos] = last_consumer
+    index.nodes[index.len] = nil
+    index.len = index.len - 1
+    index.pos_by_etcd_key[etcd_key] = nil
+    index.by_etcd_key[etcd_key] = nil
+
+    if last_consumer and last_consumer._etcd_key ~= etcd_key then
+        index.pos_by_etcd_key[last_consumer._etcd_key] = pos
+    end
+
+    local ok, err = sync_lookup_maps(index, old_consumer, nil)
+    if not ok then
+        return nil, err
+    end
+
+    if last_consumer and last_consumer._etcd_key ~= etcd_key then
+        local filled_consumer = get_filled_consumer(last_consumer)
+        for key_attr, lookup_map in pairs(index.lookup_maps) do
+            local auth_key = filled_consumer.auth_conf[key_attr]
+            if auth_key ~= nil then
+                local refreshed, refresh_err = refresh_lookup_winner(index, lookup_map, auth_key)
+                if not refreshed then
+                    return nil, refresh_err
+                end
+            end
+        end
+    end
+
+    return true
+end
+
+
+local function create_incremental_consume_cache(index, key_attr)
+    local lookup_map = {
+        values = {},
+        members = {},
+    }
+
+    for _, consumer in ipairs(index.nodes) do
+        local filled_consumer = get_filled_consumer(consumer)
+        local auth_key = filled_consumer.auth_conf[key_attr]
+        if auth_key ~= nil then
+            add_lookup_member(lookup_map, auth_key, consumer._etcd_key)
+            lookup_map.values[auth_key] = filled_consumer
+        end
+    end
+
+    return lookup_map
+end
+
+
+local function rebuild_credential_keys_by_consumer()
+    credential_keys_by_consumer = {}
+
+    if not consumers or not consumers.values then
+        credential_keys_full_sync_version = consumers and consumers.full_sync_version or 0
+        return
+    end
+
+    for _, val in ipairs(consumers.values) do
+        if type(val) == "table" and is_credential_etcd_key(val.key) then
+            local consumer_name = get_consumer_name_from_credential_etcd_key(val.key)
+            local credential_keys = credential_keys_by_consumer[consumer_name]
+            if not credential_keys then
+                credential_keys = {}
+                credential_keys_by_consumer[consumer_name] = credential_keys
+            end
+
+            credential_keys[get_consumer_short_key(val.key)] = true
+        end
+    end
+
+    credential_keys_full_sync_version = consumers.full_sync_version or 0
+end
+
+
+local function build_incremental_plugin_index(plugin_name, index)
+    clear_plugin_index(index)
+
+    if consumers.values then
+        for _, val in ipairs(consumers.values) do
+            if type(val) == "table" then
+                local plugin_conf = val.value.plugins and val.value.plugins[plugin_name]
+                if plugin_conf then
+                    local consumer, err = construct_consumer_data(val, plugin_name, plugin_conf)
+                    if consumer then
+                        local ok, sync_err = upsert_index_consumer(index, consumer)
+                        if not ok then
+                            return nil, sync_err
+                        end
+                    else
+                        core.log.error("failed to construct consumer data for plugin ",
+                                       plugin_name, ": ", err)
+                    end
+                end
+            end
+        end
+    end
+
+    index.built = true
+    index.conf_version = consumers.conf_version
+    index.full_sync_version = consumers.full_sync_version or 0
+    index.invalid = false
+    index.dirty_keys = {}
+
+    return index
+end
+
+
+local function reconcile_index_consumer(index, plugin_name, short_key)
+    local val = consumers:get(short_key)
+    local plugin_conf = val and val.value and val.value.plugins and val.value.plugins[plugin_name]
+    if not plugin_conf then
+        return remove_index_consumer(index, short_key)
+    end
+
+    local consumer, err = construct_consumer_data(val, plugin_name, plugin_conf)
+    if not consumer then
+        if is_credential_etcd_key(val.key) then
+            return remove_index_consumer(index, short_key)
+        end
+
+        return nil, err
+    end
+
+    return upsert_index_consumer(index, consumer)
+end
+
+
+local function apply_incremental_plugin_index(index, plugin_name)
+    local dirty_keys = index.dirty_keys
+    if next(dirty_keys) == nil then
+        index.conf_version = consumers.conf_version
+        index.full_sync_version = consumers.full_sync_version or 0
+        return index
+    end
+
+    local keys_to_process = {}
+    for short_key in pairs(dirty_keys) do
+        keys_to_process[short_key] = true
+
+        if is_consumer_short_key(short_key) then
+            local consumer_name = get_consumer_name_from_short_key(short_key)
+            local credential_keys = credential_keys_by_consumer[consumer_name]
+            if credential_keys then
+                for credential_key in pairs(credential_keys) do
+                    keys_to_process[credential_key] = true
+                end
+            end
+        end
+    end
+
+    index.dirty_keys = {}
+
+    for short_key in pairs(keys_to_process) do
+        local ok, err = reconcile_index_consumer(index, plugin_name, short_key)
+        if not ok then
+            index.invalid = true
+            return nil, err
+        end
+    end
+
+    index.conf_version = consumers.conf_version
+    index.full_sync_version = consumers.full_sync_version or 0
+
+    return index
 end
 
 
@@ -197,11 +585,55 @@ function _M.get_consumer_key_from_credential_key(key)
     return "/consumers/" .. uri_segs[3]
 end
 
+
 function _M.plugin(plugin_name)
+    if incremental_consumer_index_enabled then
+        local plugin_obj = plugin.get(plugin_name)
+        if not plugin_obj or plugin_obj.type ~= "auth" then
+            return nil
+        end
+
+        if credential_keys_full_sync_version ~= (consumers.full_sync_version or 0) then
+            rebuild_credential_keys_by_consumer()
+        end
+
+        local index = plugin_indexes[plugin_name]
+        if not index then
+            index = new_plugin_index(plugin_name)
+            plugin_indexes[plugin_name] = index
+        end
+
+        if not index.built or index.invalid or
+           index.full_sync_version ~= (consumers.full_sync_version or 0) then
+            local _, err = build_incremental_plugin_index(plugin_name, index)
+            if err then
+                core.log.error("failed to build consumer index for plugin ",
+                               plugin_name, ": ", err)
+                return nil
+            end
+        elseif index.conf_version ~= consumers.conf_version then
+            local _, err = apply_incremental_plugin_index(index, plugin_name)
+            if err then
+                core.log.error("failed to apply consumer index for plugin ",
+                               plugin_name, ": ", err)
+
+                local _, rebuild_err = build_incremental_plugin_index(plugin_name, index)
+                if rebuild_err then
+                    core.log.error("failed to rebuild consumer index for plugin ",
+                                   plugin_name, ": ", rebuild_err)
+                    return nil
+                end
+            end
+        end
+
+        return index
+    end
+
     local plugin_conf = core.lrucache.global("/consumers",
                             consumers.conf_version, plugin_consumer)
     return plugin_conf[plugin_name]
 end
+
 
 function _M.consumers_conf(plugin_name)
     return _M.plugin(plugin_name)
@@ -230,35 +662,17 @@ function _M.consumers()
 end
 
 
-local create_consume_cache
-do
-    local consumer_lrucache = core.lrucache.new({
-            count = consumers_count_for_lrucache
-        })
+function _M.consumers_kv(plugin_name, consumer_conf, key_attr)
+    if incremental_consumer_index_enabled and consumer_conf then
+        local lookup_map = consumer_conf.lookup_maps[key_attr]
+        if not lookup_map then
+            lookup_map = create_incremental_consume_cache(consumer_conf, key_attr)
+            consumer_conf.lookup_maps[key_attr] = lookup_map
+        end
 
-local function fill_consumer_secret(consumer)
-    local new_consumer = core.table.clone(consumer)
-    new_consumer.auth_conf = secret.fetch_secrets(new_consumer.auth_conf, false)
-    return new_consumer
-end
-
-
-function create_consume_cache(consumers_conf, key_attr)
-    local consumer_names = {}
-
-    for _, consumer in ipairs(consumers_conf.nodes) do
-        local new_consumer = consumer_lrucache(consumer, nil,
-                                fill_consumer_secret, consumer)
-        consumer_names[new_consumer.auth_conf[key_attr]] = new_consumer
+        return lookup_map.values
     end
 
-    return consumer_names
-end
-
-end
-
-
-function _M.consumers_kv(plugin_name, consumer_conf, key_attr)
     local consumers = lrucache("consumers_key#" .. plugin_name, consumer_conf.conf_version,
         create_consume_cache, consumer_conf, key_attr)
 
@@ -296,15 +710,53 @@ end
 
 
 local function filter(consumer)
-    if not consumer.value or not consumer.value.plugins then
+    if consumer.value and consumer.value.plugins then
+        plugin.set_plugins_meta_parent(consumer.value.plugins, consumer)
+    end
+
+    if not incremental_consumer_index_enabled or not consumer.key then
         return
     end
-    plugin.set_plugins_meta_parent(consumer.value.plugins, consumer)
+
+    local short_key = get_consumer_short_key(consumer.key)
+    if not short_key then
+        return
+    end
+
+    if is_credential_etcd_key(consumer.key) then
+        local consumer_name = get_consumer_name_from_credential_etcd_key(consumer.key)
+        local credential_keys = credential_keys_by_consumer[consumer_name]
+
+        if consumer.value then
+            if not credential_keys then
+                credential_keys = {}
+                credential_keys_by_consumer[consumer_name] = credential_keys
+            end
+
+            credential_keys[short_key] = true
+        elseif credential_keys then
+            credential_keys[short_key] = nil
+            if next(credential_keys) == nil then
+                credential_keys_by_consumer[consumer_name] = nil
+            end
+        end
+    end
+
+    for _, index in pairs(plugin_indexes) do
+        index.dirty_keys[short_key] = true
+    end
 end
 
 
 function _M.init_worker()
     local err
+    local local_conf = config_local.local_conf()
+    incremental_consumer_index_enabled =
+        core.table.try_read_attr(local_conf, "apisix", "enable_incremental_consumer_index") or false
+    plugin_indexes = {}
+    credential_keys_by_consumer = {}
+    credential_keys_full_sync_version = 0
+
     local cfg = {
         automatic = true,
         checker = check_consumer,
@@ -326,7 +778,6 @@ local function get_anonymous_consumer_from_local_cache(name)
         return nil, nil, "failed to get anonymous consumer " .. name
     end
 
-    -- make structure of anon_consumer similar to that of consumer_mod.consumers_kv's response
     local anon_consumer = anon_consumer_raw.value
     anon_consumer.consumer_name = anon_consumer_raw.value.id
     anon_consumer.modifiedIndex = anon_consumer_raw.modifiedIndex
