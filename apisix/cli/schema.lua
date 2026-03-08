@@ -204,6 +204,10 @@ local config_schema = {
                     type = "boolean",
                     default = true
                 },
+                enable_incremental_consumer_index = {
+                    type = "boolean",
+                    default = false,
+                },
                 ssl = {
                     type = "object",
                     properties = {

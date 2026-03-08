@@ -28,6 +28,7 @@ apisix:
   enable_admin: true           # Admin API
   enable_dev_mode: false       # If true, set nginx `worker_processes` to 1.
   enable_reuseport: true       # If true, enable nginx SO_REUSEPORT option.
+  enable_incremental_consumer_index: false  # If true, incrementally maintain auth consumer indexes instead of rebuilding them on every consumer change.
   show_upstream_status_in_response_header: false  # If true, include the upstream HTTP status code in
                                                   # the response header `X-APISIX-Upstream-Status`.
                                                   # If false, show `X-APISIX-Upstream-Status` only if

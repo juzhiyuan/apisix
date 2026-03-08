@@ -23,6 +23,7 @@ local _M = {
     enable_admin = true,
     enable_dev_mode = false,
     enable_reuseport = true,
+    enable_incremental_consumer_index = false,
     show_upstream_status_in_response_header = false,
     enable_ipv6 = true,
     enable_http2 = true,

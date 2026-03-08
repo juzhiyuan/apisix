@@ -640,6 +640,8 @@ local function load_full_data(self, dir_res, headers)
         self.conf_version = self.conf_version + 1
     end
 
+    self.full_sync_version = self.prev_index
+
     self.need_reload = false
     sync_status_to_shdict(true)
 end
@@ -1033,6 +1035,7 @@ function _M.new(key, opts)
         sync_times = 0,
         running = true,
         conf_version = 0,
+        full_sync_version = 0,
         values = {},
         need_reload = true,
         watching_stream = nil,
